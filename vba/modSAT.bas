@@ -8,8 +8,12 @@ Public Const PICK_NAME As String = "PickBtn"
 Public Const ZOOM_NAME As String = "ZoomPic"
 Public Const CELLPIC As String = "CellPic_"
 
-' Set True if in-cell pictures misbehave; forces the classic sized-picture mode.
-Public ForceClassicPicture As Boolean
+' Pictures are placed as NORMAL pictures anchored to their cell by default.
+' Reason: the modern "in-cell" picture is stored as a rich value that Excel
+' 2016/2019/2021 cannot read - those versions show #UNKNOWN! instead of the
+' picture. An anchored normal picture renders on every Excel, on Mac, and on
+' the web. Call SetClassicMode False to opt into in-cell pictures on 365.
+Public UseInCellPicture As Boolean
 Private gExportBroken As Boolean
 
 Private gItems() As String
@@ -105,16 +109,13 @@ Public Function BuildPickList(c As Range) As Long
     BuildPickList = gCount
 End Function
 
-Public Sub ShowListPopup()
+' Builds the popup menu for the active cell. Split out from ShowListPopup so it
+' can be tested without ShowPopup blocking on a modal menu.
+Public Function BuildPopupBar() As Long
     Dim cb As CommandBar, ci As CommandBarButton, i As Long, n As Long
     On Error GoTo Oops
     n = BuildPickList(ActiveCell)
-    If n = 0 Then
-        MsgBox "No options to show yet." & vbCrLf & vbCrLf & _
-               "If this is the Topic column, choose a Section in this row first.", _
-               vbInformation, "Nothing to choose"
-        Exit Sub
-    End If
+    If n = 0 Then Exit Function
     On Error Resume Next
     Application.CommandBars("SATPick").Delete
     On Error GoTo Oops
@@ -123,14 +124,33 @@ Public Sub ShowListPopup()
         Set ci = cb.Controls.Add(msoControlButton)
         ci.Caption = gItems(i)
         ci.Style = msoButtonCaption
-        ci.OnAction = "PickByIndex " & i
+        ci.Tag = CStr(i)
+        ci.OnAction = "'PickByIndex " & i & "'"
     Next i
     Set ci = cb.Controls.Add(msoControlButton)
     ci.Caption = "(clear this cell)"
     ci.Style = msoButtonCaption
     ci.BeginGroup = True
-    ci.OnAction = "PickByIndex -1"
-    cb.ShowPopup
+    ci.Tag = "-1"
+    ci.OnAction = "'PickByIndex -1'"
+    BuildPopupBar = n
+    Exit Function
+Oops:
+    BuildPopupBar = -1
+End Function
+
+Public Sub ShowListPopup()
+    Dim n As Long
+    On Error GoTo Oops
+    n = BuildPopupBar()
+    If n = 0 Then
+        MsgBox "No options to show yet." & vbCrLf & vbCrLf & _
+               "If this is the Topic column, choose a Section in this row first.", _
+               vbInformation, "Nothing to choose"
+        Exit Sub
+    End If
+    If n < 0 Then GoTo Oops
+    Application.CommandBars("SATPick").ShowPopup
     Exit Sub
 Oops:
     MsgBox "Could not open the list here." & vbCrLf & _
@@ -138,8 +158,19 @@ Oops:
            vbInformation, "SAT Log"
 End Sub
 
-Public Sub PickByIndex(ByVal idx As Long)
+Public Sub PickByIndex(Optional ByVal idx As Long = -999)
     On Error GoTo Oops
+    ' An OnAction argument only survives if the whole call is wrapped in single
+    ' quotes, and some builds/locales still drop it. If it did not arrive, read
+    ' the index back off the control that was clicked.
+    If idx = -999 Then
+        On Error Resume Next
+        idx = CLng(Application.CommandBars.ActionControl.Tag)
+        If Err.Number <> 0 Then idx = -999
+        Err.Clear
+        On Error GoTo Oops
+    End If
+    If idx = -999 Then Exit Sub
     If gTarget Is Nothing Then Exit Sub
     Application.EnableEvents = False
     If idx < 0 Then
@@ -172,7 +203,7 @@ Public Sub InsertShot(ws As Worksheet, r As Long, sc As Long, f As String)
     RemoveCellPic ws, r
 
     okInCell = False
-    If Not ForceClassicPicture Then
+    If UseInCellPicture Then
         On Error Resume Next
         Set rg = c
         rg.InsertPictureInCell f
@@ -421,6 +452,8 @@ Quiet:
 End Sub
 
 Public Sub SetClassicMode(ByVal onOff As Boolean)
-    ' Force the old-Excel picture mode (also used to test that fallback).
-    ForceClassicPicture = onOff
+    ' True  = normal picture anchored to the cell. Works on every Excel. Default.
+    ' False = modern in-cell picture. Microsoft 365 / Excel 2024 only, and shows
+    '         #UNKNOWN! for anyone opening the file on an older Excel.
+    UseInCellPicture = Not onOff
 End Sub
