@@ -1,25 +1,29 @@
+' SAT Smart Mistake Sheet
+' Made by Muhammad Salar Khan
+' Instagram: @salars_catalogue  https://www.instagram.com/salars_catalogue/
+' Updates:   https://github.com/dev-flowstate/SAT-Smart-Mistake-Sheet
+
 Option Explicit
 
 Public Const HDR_ROW As Long = 4
 Public Const FIRST_ROW As Long = 5
-Public Const PATH_COL As Long = 17
 Public Const BTN_NAME As String = "PhotoBtn"
 Public Const PICK_NAME As String = "PickBtn"
 Public Const ZOOM_NAME As String = "ZoomPic"
 Public Const CELLPIC As String = "CellPic_"
 
-' Pictures are placed as NORMAL pictures anchored to their cell by default.
-' Reason: the modern "in-cell" picture is stored as a rich value that Excel
-' 2016/2019/2021 cannot read - those versions show #UNKNOWN! instead of the
-' picture. An anchored normal picture renders on every Excel, on Mac, and on
-' the web. Call SetClassicMode False to opt into in-cell pictures on 365.
-Public UseInCellPicture As Boolean
-Private gExportBroken As Boolean
-
 Private gItems() As String
 Private gCount As Long
 Private gTarget As Range
+Private gPhotoRow As Long
+Private gLastShapeCount As Long
+Private gSeq As Long
+Private gHook As CUIHook
+Private gLastAdoptRow As Long
 
+' =====================================================================
+'  helpers
+' =====================================================================
 Public Function LogSheet() As Worksheet
     Set LogSheet = ThisWorkbook.Worksheets("Mistake Log")
 End Function
@@ -34,19 +38,11 @@ Public Function ShotCol(ws As Worksheet) As Long
     Next c
 End Function
 
-' Works on Windows and Mac; falls back to the workbook folder if neither is writable.
-Public Function StoreDir() As String
-    Dim base As String, sep As String, d As String
-    sep = Application.PathSeparator
-    base = Environ$("USERPROFILE")
-    If Len(base) = 0 Then base = Environ$("HOME")
-    If Len(base) = 0 Then base = ThisWorkbook.Path
-    d = base & sep & "Pictures" & sep & "SAT Question Screenshots"
-    On Error Resume Next
-    If Len(Dir(d, vbDirectory)) = 0 Then MkDir d
-    On Error GoTo 0
-    If Len(Dir(d, vbDirectory)) = 0 Then d = ThisWorkbook.Path
-    StoreDir = d
+' Fully qualified name for menus and keys built at run time. They are never
+' saved, so renaming the file cannot break them, and a second open copy of
+' the log can never answer a click meant for this one.
+Private Function MacroRef(ByVal procName As String) As String
+    MacroRef = "'" & Replace(ThisWorkbook.Name, "'", "''") & "'!" & procName
 End Function
 
 Public Function HasList(c As Range) As Boolean
@@ -58,6 +54,11 @@ Public Function HasList(c As Range) As Boolean
     On Error GoTo 0
 End Function
 
+Private Function IsHelperShape(ByVal nm As String) As Boolean
+    IsHelperShape = (nm = ZOOM_NAME Or nm = BTN_NAME Or nm = PICK_NAME Or _
+                     Left$(nm, Len(CELLPIC)) = CELLPIC)
+End Function
+
 Public Function ZoomOpen() As Boolean
     Dim s As Shape
     On Error Resume Next
@@ -66,12 +67,48 @@ Public Function ZoomOpen() As Boolean
     On Error GoTo 0
 End Function
 
-Private Function IsHelperShape(nm As String) As Boolean
-    IsHelperShape = (nm = ZOOM_NAME Or nm = BTN_NAME Or nm = PICK_NAME Or _
-                     Left$(nm, Len(CELLPIC)) = CELLPIC)
+' A row's photo is found by WHERE it sits, not by its name, so photos stay
+' matched to their row after sorting or filtering.
+Public Function PhotoShapeForRow(ws As Worksheet, ByVal r As Long) As Shape
+    Dim sh As Shape, sc As Long, c As Range, midX As Double, midY As Double
+    sc = ShotCol(ws)
+    If sc = 0 Then Exit Function
+    Set c = ws.Cells(r, sc)
+    For Each sh In ws.Shapes
+        If Left$(sh.Name, Len(CELLPIC)) = CELLPIC Then
+            midX = sh.Left + sh.Width / 2
+            midY = sh.Top + sh.Height / 2
+            If midY >= c.Top And midY < c.Top + c.Height And _
+               midX >= c.Left And midX < c.Left + c.Width Then
+                Set PhotoShapeForRow = sh
+                Exit Function
+            End If
+        End If
+    Next sh
 End Function
 
-' ---------- dropdown list, centred in the cell ----------
+Private Function RowOfPhoto(ws As Worksheet, sh As Shape) As Long
+    Dim r As Long, midY As Double
+    midY = sh.Top + sh.Height / 2
+    r = sh.TopLeftCell.Row
+    Do While r < sh.BottomRightCell.Row
+        If ws.Rows(r).Top + ws.Rows(r).Height > midY Then Exit Do
+        r = r + 1
+    Loop
+    RowOfPhoto = r
+End Function
+
+Public Function PhotoCount() As Long
+    Dim sh As Shape, n As Long
+    For Each sh In LogSheet().Shapes
+        If Left$(sh.Name, Len(CELLPIC)) = CELLPIC Then n = n + 1
+    Next sh
+    PhotoCount = n
+End Function
+
+' =====================================================================
+'  dropdown list, centred in the cell
+' =====================================================================
 Public Function BuildPickList(c As Range) As Long
     Dim f As String, rng As Range, v As Variant, i As Long, parts() As String
     gCount = 0
@@ -109,8 +146,8 @@ Public Function BuildPickList(c As Range) As Long
     BuildPickList = gCount
 End Function
 
-' Builds the popup menu for the active cell. Split out from ShowListPopup so it
-' can be tested without ShowPopup blocking on a modal menu.
+' Builds the popup for the active cell. Kept separate from ShowListPopup so a
+' test can build it and fire each entry with .Execute() - ShowPopup is modal.
 Public Function BuildPopupBar() As Long
     Dim cb As CommandBar, ci As CommandBarButton, i As Long, n As Long
     On Error GoTo Oops
@@ -122,17 +159,18 @@ Public Function BuildPopupBar() As Long
     Set cb = Application.CommandBars.Add("SATPick", msoBarPopup, False, True)
     For i = 0 To n - 1
         Set ci = cb.Controls.Add(msoControlButton)
-        ci.Caption = gItems(i)
+        ' "&" marks a menu shortcut key, so a literal & must be doubled
+        ci.Caption = Replace(gItems(i), "&", "&&")
         ci.Style = msoButtonCaption
         ci.Tag = CStr(i)
-        ci.OnAction = "'PickByIndex " & i & "'"
+        ci.OnAction = MacroRef("PickFromMenu")
     Next i
     Set ci = cb.Controls.Add(msoControlButton)
     ci.Caption = "(clear this cell)"
     ci.Style = msoButtonCaption
     ci.BeginGroup = True
     ci.Tag = "-1"
-    ci.OnAction = "'PickByIndex -1'"
+    ci.OnAction = MacroRef("PickFromMenu")
     BuildPopupBar = n
     Exit Function
 Oops:
@@ -154,23 +192,24 @@ Public Sub ShowListPopup()
     Exit Sub
 Oops:
     MsgBox "Could not open the list here." & vbCrLf & _
-           "You can still type the value, or use the small arrow at the cell edge.", _
+           "You can still use the small arrow at the right edge of the cell.", _
            vbInformation, "SAT Log"
 End Sub
 
-Public Sub PickByIndex(Optional ByVal idx As Long = -999)
-    On Error GoTo Oops
-    ' An OnAction argument only survives if the whole call is wrapped in single
-    ' quotes, and some builds/locales still drop it. If it did not arrive, read
-    ' the index back off the control that was clicked.
-    If idx = -999 Then
-        On Error Resume Next
-        idx = CLng(Application.CommandBars.ActionControl.Tag)
-        If Err.Number <> 0 Then idx = -999
-        Err.Clear
-        On Error GoTo Oops
-    End If
+' Menu entries carry no argument - the index rides on the control's Tag - so
+' there is no OnAction quoting to get wrong.
+Public Sub PickFromMenu()
+    Dim idx As Long
+    idx = -999
+    On Error Resume Next
+    idx = CLng(Application.CommandBars.ActionControl.Tag)
+    On Error GoTo 0
     If idx = -999 Then Exit Sub
+    PickByIndex idx
+End Sub
+
+Public Sub PickByIndex(ByVal idx As Long)
+    On Error GoTo Oops
     If gTarget Is Nothing Then Exit Sub
     Application.EnableEvents = False
     If idx < 0 Then
@@ -185,210 +224,352 @@ Oops:
     Application.EnableEvents = True
 End Sub
 
-' ---------- photos ----------
-Private Sub RemoveCellPic(ws As Worksheet, r As Long)
-    On Error Resume Next
-    ws.Shapes(CELLPIC & r).Delete
-    On Error GoTo 0
-End Sub
-
-' Puts the picture in the cell. Uses the modern in-cell picture where Excel
-' supports it, otherwise a normal picture shrunk to fit and locked to the cell.
-Public Sub InsertShot(ws As Worksheet, r As Long, sc As Long, f As String)
-    Dim rg As Object, c As Range, p As Shape, k As Double, okInCell As Boolean
+' =====================================================================
+'  photos
+' =====================================================================
+' Fits a picture inside a cell and locks it there. Any photo already on that
+' row is replaced. The picture is embedded in the workbook, so it travels
+' with the file when it is emailed.
+Private Sub PlaceShapeInCell(ws As Worksheet, sh As Shape, ByVal r As Long, ByVal sc As Long)
+    Dim c As Range, k As Double, old As Shape, ev As Boolean, guard As Long
+    ev = Application.EnableEvents
+    Application.EnableEvents = False
     Set c = ws.Cells(r, sc)
+    gSeq = gSeq + 1
+    sh.Name = "SATPlacing" & gSeq          ' so the loop below cannot find it
+    Do
+        Set old = PhotoShapeForRow(ws, r)
+        If old Is Nothing Then Exit Do
+        old.Delete
+        guard = guard + 1
+        If guard > 20 Then Exit Do
+    Loop
     On Error Resume Next
-    c.ClearContents
+    c.ClearContents                        ' also clears any Place-in-Cell picture
+    sh.Placement = 3
+    sh.LockAspectRatio = msoTrue
+    sh.ScaleHeight 1, msoTrue              ' back to natural size before fitting
+    sh.ScaleWidth 1, msoTrue
     On Error GoTo 0
-    RemoveCellPic ws, r
-
-    okInCell = False
-    If UseInCellPicture Then
-        On Error Resume Next
-        Set rg = c
-        rg.InsertPictureInCell f
-        okInCell = (Err.Number = 0)
-        Err.Clear
-        On Error GoTo 0
-    End If
-
-    If Not okInCell Then
-        On Error Resume Next
-        Set p = ws.Shapes.AddPicture(f, msoFalse, msoCTrue, c.Left + 2, c.Top + 2, -1, -1)
-        If Not p Is Nothing Then
-            p.Name = CELLPIC & r
-            p.LockAspectRatio = msoTrue
-            k = Application.Min((c.Width - 4) / p.Width, (c.Height - 4) / p.Height)
-            If k > 0 Then p.Width = p.Width * k
-            p.Left = c.Left + (c.Width - p.Width) / 2
-            p.Top = c.Top + (c.Height - p.Height) / 2
-            p.Placement = 1
-            p.OnAction = "ZoomFromPicture"
-        End If
-        On Error GoTo 0
-    End If
-    ws.Cells(r, PATH_COL).Value = f
+    k = Application.Min((c.Width - 6) / sh.Width, (c.Height - 6) / sh.Height)
+    If k > 0 Then sh.Width = sh.Width * k
+    sh.Left = c.Left + (c.Width - sh.Width) / 2
+    sh.Top = c.Top + (c.Height - sh.Height) / 2
+    sh.Placement = 1                       ' move and size with cells
+    sh.Name = CELLPIC & Format$(Now, "yyyymmddhhnnss") & "_" & gSeq
+    sh.OnAction = "ZoomFromPicture"
+    On Error Resume Next
+    sh.AlternativeText = "Question screenshot"
+    On Error GoTo 0
+    Application.EnableEvents = ev
 End Sub
 
-' clicking a fallback picture zooms it, same as the in-cell version
-Public Sub ZoomFromPicture()
-    Dim nm As String, r As Long
-    On Error Resume Next
-    nm = Application.Caller
-    If Left$(nm, Len(CELLPIC)) = CELLPIC Then
-        r = CLng(Mid$(nm, Len(CELLPIC) + 1))
-        ZoomPhoto r
-    End If
+Public Sub AddPhotoFile(ByVal r As Long, ByVal f As String)
+    Dim ws As Worksheet, sc As Long, sh As Shape
+    Set ws = LogSheet()
+    sc = ShotCol(ws)
+    If sc = 0 Or r < FIRST_ROW Then Exit Sub
+    Set sh = ws.Shapes.AddPicture(f, msoFalse, msoCTrue, ws.Cells(r, sc).Left, ws.Cells(r, sc).Top, -1, -1)
+    PlaceShapeInCell ws, sh, r, sc
+    gLastShapeCount = ws.Shapes.Count
 End Sub
 
-Private Function ExportShape(ws As Worksheet, sh As Shape, f As String) As Boolean
-    Dim co As ChartObject
-    On Error GoTo Fail
-    sh.Copy
-    Set co = ws.ChartObjects.Add(0, 0, sh.Width, sh.Height)
-    co.Chart.Paste
-    co.Chart.Export f, "PNG"
-    co.Delete
-    ExportShape = True
-    Exit Function
-Fail:
+Public Sub RemovePhotoRow(ByVal r As Long)
+    Dim ws As Worksheet, sh As Shape, ev As Boolean, sc As Long, guard As Long
+    Set ws = LogSheet()
+    sc = ShotCol(ws)
+    ev = Application.EnableEvents
+    Application.EnableEvents = False
     On Error Resume Next
-    If Not co Is Nothing Then co.Delete
-    ExportShape = False
-End Function
+    CloseZoomQuiet
+    Do
+        Set sh = Nothing
+        Set sh = PhotoShapeForRow(ws, r)
+        If sh Is Nothing Then Exit Do
+        sh.Delete
+        guard = guard + 1
+        If guard > 20 Then Exit Do
+    Loop
+    ws.Cells(r, sc).ClearContents
+    Err.Clear
+    On Error GoTo 0
+    Application.EnableEvents = ev
+    gLastShapeCount = ws.Shapes.Count
+End Sub
 
-Public Function FitFloating(ws As Worksheet) As Long
-    Dim i As Long, sh As Shape, r As Long, f As String, sc As Long, n As Long
-    If gExportBroken Then Exit Function
+' Pictures dropped anywhere on a row (right-click Paste, drag in) are pulled
+' into that row's screenshot cell the next time the selection moves.
+Public Function AdoptLoosePictures(ws As Worksheet) As Long
+    Dim sh As Shape, sc As Long, r As Long, n As Long, i As Long
+    Dim names As New Collection, rows As New Collection
+    If ws.Shapes.Count = gLastShapeCount Then Exit Function
     sc = ShotCol(ws)
     If sc = 0 Then Exit Function
-    On Error GoTo Done
-    Application.EnableEvents = False
-    For i = ws.Shapes.Count To 1 Step -1
-        Set sh = ws.Shapes(i)
+    For Each sh In ws.Shapes
         If sh.Type = msoPicture Then
             If Not IsHelperShape(sh.Name) Then
                 r = sh.TopLeftCell.Row
-                If r < FIRST_ROW Then r = FIRST_ROW
-                f = StoreDir() & Application.PathSeparator & "q_" & _
-                    Format(Now, "yyyymmdd_hhnnss") & "_" & i & ".png"
-                If ExportShape(ws, sh, f) Then
-                    sh.Delete
-                    InsertShot ws, r, sc, f
-                    n = n + 1
-                Else
-                    gExportBroken = True     ' this Excel cannot export; stop retrying
-                    GoTo Done
+                If r >= FIRST_ROW Then
+                    names.Add sh.Name
+                    rows.Add r
+                    gLastAdoptRow = r
                 End If
             End If
         End If
+    Next sh
+    On Error Resume Next
+    For i = 1 To names.Count
+        PlaceShapeInCell ws, ws.Shapes(names(i)), rows(i), sc
+        If Err.Number = 0 Then n = n + 1
+        Err.Clear
     Next i
-Done:
-    Application.EnableEvents = True
-    FitFloating = n
+    On Error GoTo 0
+    gLastShapeCount = ws.Shapes.Count
+    AdoptLoosePictures = n
 End Function
 
-Public Sub ZoomPhoto(r As Long)
-    Dim ws As Worksheet, f As String, p As Shape, k As Double, btn As Shape
-    On Error GoTo Oops
+' ---------- Ctrl+V ----------
+' Excel pastes the picture normally. A listener INSIDE this workbook notices the
+' new picture as soon as it appears and fits it into its row's cell.
+' No Application.OnKey: that switch lives on Excel itself, so if it were ever
+' left on, Ctrl+V in any other workbook would reopen this file.
+Public Sub ArmHook()
+    On Error Resume Next
+    If gHook Is Nothing Then
+        Set gHook = New CUIHook
+        Set gHook.Bars = Application.CommandBars
+    End If
+End Sub
+
+' Called on every UI refresh, so it must be cheap: one count comparison.
+Public Sub OnUiUpdate()
+    Static busy As Boolean
+    Dim ws As Worksheet, sc As Long
+    If busy Then Exit Sub
+    On Error GoTo Done
+    If Not ActiveWorkbook Is ThisWorkbook Then Exit Sub
+    If TypeName(ActiveSheet) <> "Worksheet" Then Exit Sub
+    If ActiveSheet.Name <> "Mistake Log" Then Exit Sub
+    Set ws = ActiveSheet
+    If ws.Shapes.Count = gLastShapeCount Then Exit Sub
+    busy = True
+    If AdoptLoosePictures(ws) > 0 Then
+        sc = ShotCol(ws)
+        ws.Cells(gLastAdoptRow, sc).Select
+        PositionButtons ws, ws.Cells(gLastAdoptRow, sc)
+    End If
+Done:
+    busy = False
+End Sub
+
+' ---------- Delete key ----------
+' Pressing Delete on a Question Screenshot cell removes its photo. Only for a
+' single row, so sorting or a bulk paste can never wipe photos.
+Public Sub PhotoCellEdited(ws As Worksheet, Target As Range)
+    Dim sc As Long, hit As Range, cell As Range
+    sc = ShotCol(ws)
+    If sc = 0 Then Exit Sub
+    If Target.Rows.Count > 1 Then Exit Sub
+    Set hit = Intersect(Target, ws.Columns(sc))
+    If hit Is Nothing Then Exit Sub
+    Set cell = hit.Cells(1, 1)
+    If cell.Row < FIRST_ROW Then Exit Sub
+    If Len(CStr(cell.Value)) > 0 Then Exit Sub
+    If PhotoShapeForRow(ws, cell.Row) Is Nothing Then Exit Sub
+    RemovePhotoRow cell.Row
+    PositionButtons ws, Selection
+End Sub
+
+' ---------- zoom ----------
+Public Sub ZoomRow(ByVal r As Long)
+    Dim ws As Worksheet, src As Shape
     Set ws = LogSheet()
-    f = CStr(ws.Cells(r, PATH_COL).Value)
-    If Len(f) = 0 Then
-        MsgBox "No picture saved for this row yet." & vbCrLf & vbCrLf & _
-               "Select the Question Screenshot cell and click Add Photo.", _
-               vbInformation, "Nothing to zoom"
+    Set src = PhotoShapeForRow(ws, r)
+    If src Is Nothing Then
+        MsgBox "There is no photo on this row yet." & vbCrLf & vbCrLf & _
+               "Click the Question Screenshot cell and use Add Photo, " & _
+               "or copy a screenshot and press Ctrl+V.", vbInformation, "Nothing to zoom"
         Exit Sub
     End If
-    If Len(Dir(f)) = 0 Then
-        MsgBox "The picture file for this row was moved or deleted:" & vbCrLf & f, _
-               vbExclamation, "File not found"
-        Exit Sub
+    ZoomShape ws, src
+End Sub
+
+' Enlarges a copy of the embedded picture - no file on disk is needed, so zoom
+' still works after the log has been emailed to someone else.
+Private Sub ZoomShape(ws As Worksheet, src As Shape)
+    Dim z As Shape, k As Double, ev As Boolean, btn As Shape, vr As Range
+    Dim zf As Double, vw As Double, vh As Double, topOff As Double
+    ev = Application.EnableEvents
+    Application.EnableEvents = False
+    On Error GoTo Oops
+    CloseZoomQuiet
+    Set z = src.Duplicate
+    z.Name = ZOOM_NAME
+    z.Placement = 3
+    z.LockAspectRatio = msoTrue
+    On Error Resume Next
+    z.ScaleHeight 1, msoTrue
+    z.ScaleWidth 1, msoTrue
+    On Error GoTo Oops
+    zf = ActiveWindow.Zoom / 100
+    If zf <= 0 Then zf = 1
+    If ActiveWindow.FreezePanes And ActiveWindow.SplitRow > 0 Then
+        topOff = ws.Range(ws.Rows(1), ws.Rows(ActiveWindow.SplitRow)).Height
     End If
-    CloseZoom
-    Set p = ws.Shapes.AddPicture(f, msoFalse, msoCTrue, 0, 0, -1, -1)
-    p.Name = ZOOM_NAME
-    p.LockAspectRatio = msoTrue
-    k = Application.Min(ActiveWindow.UsableWidth * 0.88 / p.Width, _
-                        ActiveWindow.UsableHeight * 0.88 / p.Height)
-    If k < 1 Then p.Width = p.Width * k
-    p.Top = ActiveWindow.VisibleRange.Top + (ActiveWindow.UsableHeight - p.Height) / 2
-    p.Left = ActiveWindow.VisibleRange.Left + (ActiveWindow.UsableWidth - p.Width) / 2
-    p.OnAction = "CloseZoom"
-    p.ZOrder msoBringToFront
+    vw = ActiveWindow.UsableWidth / zf
+    vh = ActiveWindow.UsableHeight / zf - topOff
+    k = Application.Min(vw * 0.86 / z.Width, vh * 0.82 / z.Height, 3)
+    z.Width = z.Width * k
+    Set vr = ActiveWindow.VisibleRange
+    z.Left = vr.Left + (vw - z.Width) / 2
+    z.Top = vr.Top + (vh - z.Height) / 2
+    If z.Top < vr.Top Then z.Top = vr.Top
+    If z.Left < vr.Left Then z.Left = vr.Left
+    z.Line.Visible = msoTrue
+    z.Line.ForeColor.RGB = RGB(37, 99, 235)
+    z.Line.Weight = 3
+    z.OnAction = "CloseZoom"
+    z.ZOrder msoBringToFront
     On Error Resume Next
     Set btn = ws.Shapes(BTN_NAME)
     If Not btn Is Nothing Then
         btn.Visible = msoTrue
-        btn.Width = 60
-        btn.Height = 19
-        btn.Left = p.Left + p.Width - btn.Width - 6
-        btn.Top = p.Top + 6
         btn.TextFrame2.TextRange.Text = "Close"
+        btn.Width = 64
+        btn.Height = 20
+        btn.Left = z.Left + z.Width - btn.Width - 8
+        btn.Top = z.Top + 8
         btn.ZOrder msoBringToFront
     End If
     ws.Shapes(PICK_NAME).Visible = msoFalse
     On Error GoTo 0
-    Application.StatusBar = "Click Close, or the picture itself, to put it back in the cell."
+    Application.StatusBar = "Click Close, or click the picture, to put it back."
+    Application.EnableEvents = ev
     Exit Sub
 Oops:
+    Application.EnableEvents = ev
     Application.StatusBar = False
-    MsgBox "Could not open that picture: " & Err.Description, vbExclamation, "SAT Log"
+End Sub
+
+Public Sub CloseZoomQuiet()
+    On Error Resume Next
+    LogSheet().Shapes(ZOOM_NAME).Delete
+    Application.StatusBar = False
 End Sub
 
 Public Sub CloseZoom()
-    Dim ws As Worksheet
+    CloseZoomQuiet
     On Error Resume Next
-    Set ws = LogSheet()
-    ws.Shapes(ZOOM_NAME).Delete
-    Application.StatusBar = False
-    PositionButtons ws, Selection
+    If ActiveSheet.Name = LogSheet().Name Then PositionButtons LogSheet(), Selection
 End Sub
 
+' Clicking a photo selects its cell (so its button shows) and enlarges it.
+Public Sub ZoomFromPicture()
+    Dim ws As Worksheet, sh As Shape, r As Long
+    On Error GoTo Quiet
+    Set ws = LogSheet()
+    Set sh = ws.Shapes(CStr(Application.Caller))
+    r = RowOfPhoto(ws, sh)
+    If r >= FIRST_ROW Then ws.Cells(r, ShotCol(ws)).Select
+    ZoomShape ws, sh
+Quiet:
+End Sub
+
+' ---------- the photo button and its menu ----------
 Private Function PickFile() As String
-    Dim fd As FileDialog
+    Dim fd As FileDialog, v As Variant
     On Error Resume Next
     Set fd = Application.FileDialog(msoFileDialogFilePicker)
     If fd Is Nothing Then
-        PickFile = CStr(Application.GetOpenFilename("Images, *.png;*.jpg;*.jpeg;*.gif;*.bmp"))
-        If PickFile = "False" Then PickFile = ""
+        v = Application.GetOpenFilename("Images (*.png;*.jpg;*.jpeg;*.gif;*.bmp),*.png;*.jpg;*.jpeg;*.gif;*.bmp")
+        If VarType(v) = vbString Then PickFile = v
         Exit Function
     End If
     fd.Title = "Choose the question screenshot"
+    fd.AllowMultiSelect = False
     fd.Filters.Clear
     fd.Filters.Add "Images", "*.png; *.jpg; *.jpeg; *.gif; *.bmp"
     If fd.Show = -1 Then PickFile = fd.SelectedItems(1)
 End Function
 
 Public Sub PhotoButtonClick()
-    Dim ws As Worksheet, sc As Long, r As Long, f As String
+    Dim ws As Worksheet, r As Long, f As String
     On Error GoTo Oops
     Set ws = LogSheet()
     If ZoomOpen() Then
         CloseZoom
         Exit Sub
     End If
-    sc = ShotCol(ws)
+    AdoptLoosePictures ws
     r = ActiveCell.Row
     If r < FIRST_ROW Then Exit Sub
-    If Len(CStr(ws.Cells(r, PATH_COL).Value)) > 0 Then
-        ZoomPhoto r
-        Exit Sub
-    End If
-    If FitFloating(ws) > 0 Then
-        PositionButtons ws, ActiveCell
+    If Not PhotoShapeForRow(ws, r) Is Nothing Then
+        ShowPhotoMenu
         Exit Sub
     End If
     f = PickFile()
     If Len(f) = 0 Then Exit Sub
-    InsertShot ws, r, sc, f
-    PositionButtons ws, ActiveCell
+    AddPhotoFile r, f
+    PositionButtons ws, ws.Cells(r, ShotCol(ws))
     Exit Sub
 Oops:
     Application.EnableEvents = True
     MsgBox "Could not add that picture: " & Err.Description, vbExclamation, "SAT Log"
 End Sub
 
-Public Sub PositionButtons(ws As Worksheet, Target As Range)
+Private Sub AddMenuItem(cb As CommandBar, ByVal cap As String, ByVal proc As String, ByVal newGroup As Boolean)
+    Dim ci As CommandBarButton
+    Set ci = cb.Controls.Add(msoControlButton)
+    ci.Caption = cap
+    ci.Style = msoButtonCaption
+    ci.BeginGroup = newGroup
+    ci.OnAction = MacroRef(proc)
+End Sub
+
+Public Function BuildPhotoMenu() As Long
+    Dim cb As CommandBar
+    gPhotoRow = ActiveCell.Row
+    On Error Resume Next
+    Application.CommandBars("SATPhoto").Delete
+    On Error GoTo 0
+    Set cb = Application.CommandBars.Add("SATPhoto", msoBarPopup, False, True)
+    AddMenuItem cb, "Zoom In", "ZoomMenuRow", False
+    AddMenuItem cb, "Replace Photo...", "ReplaceMenuRow", False
+    AddMenuItem cb, "Remove Photo", "RemoveMenuRow", True
+    BuildPhotoMenu = cb.Controls.Count
+End Function
+
+Public Sub ShowPhotoMenu()
+    On Error GoTo Oops
+    If BuildPhotoMenu() > 0 Then Application.CommandBars("SATPhoto").ShowPopup
+    Exit Sub
+Oops:
+    MsgBox "Could not open the photo menu: " & Err.Description, vbExclamation, "SAT Log"
+End Sub
+
+Public Sub ZoomMenuRow()
+    ZoomRow gPhotoRow
+End Sub
+
+Public Sub ReplaceMenuRow()
+    Dim f As String
+    If gPhotoRow < FIRST_ROW Then Exit Sub
+    f = PickFile()
+    If Len(f) = 0 Then Exit Sub            ' cancelled: the old photo stays
+    AddPhotoFile gPhotoRow, f               ' replaces whatever was on the row
+    PositionButtons LogSheet(), LogSheet().Cells(gPhotoRow, ShotCol(LogSheet()))
+End Sub
+
+Public Sub RemoveMenuRow()
+    If gPhotoRow < FIRST_ROW Then Exit Sub
+    RemovePhotoRow gPhotoRow
+    PositionButtons LogSheet(), LogSheet().Cells(gPhotoRow, ShotCol(LogSheet()))
+End Sub
+
+' =====================================================================
+'  keep both buttons centred on the selected cell
+' =====================================================================
+Public Sub PositionButtons(ws As Worksheet, Target As Object)
     Dim sc As Long, photo As Shape, pick As Shape, c As Range, lbl As String
     Dim ok As Boolean
     On Error GoTo Quiet
@@ -403,20 +584,19 @@ Public Sub PositionButtons(ws As Worksheet, Target As Range)
         Exit Sub
     End If
 
-    ok = True
-    If Target Is Nothing Then ok = False
-    If ok Then If Target.Cells.Count > 1 Then ok = False
-    If ok Then If Target.Row < FIRST_ROW Then ok = False
+    ok = (TypeName(Target) = "Range")
+    If ok Then ok = (Target.Cells.Count = 1)
+    If ok Then ok = (Target.Row >= FIRST_ROW)
 
     If Not photo Is Nothing Then
         If ok And Target.Column = sc Then
             Set c = ws.Cells(Target.Row, sc)
-            photo.Visible = msoTrue
-            If Len(CStr(ws.Cells(Target.Row, PATH_COL).Value)) > 0 Then
-                photo.TextFrame2.TextRange.Text = "Zoom In"
-            Else
+            If PhotoShapeForRow(ws, Target.Row) Is Nothing Then
                 photo.TextFrame2.TextRange.Text = "Add Photo"
+            Else
+                photo.TextFrame2.TextRange.Text = "Photo " & ChrW(9660)
             End If
+            photo.Visible = msoTrue
             photo.Width = 76
             photo.Height = 19
             photo.Left = c.Left + (c.Width - photo.Width) / 2
@@ -449,11 +629,4 @@ Public Sub PositionButtons(ws As Worksheet, Target As Range)
         End If
     End If
 Quiet:
-End Sub
-
-Public Sub SetClassicMode(ByVal onOff As Boolean)
-    ' True  = normal picture anchored to the cell. Works on every Excel. Default.
-    ' False = modern in-cell picture. Microsoft 365 / Excel 2024 only, and shows
-    '         #UNKNOWN! for anyone opening the file on an older Excel.
-    UseInCellPicture = Not onOff
 End Sub
