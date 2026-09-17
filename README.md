@@ -11,7 +11,8 @@ find the topics you keep missing, and review them before the next test.
 |---|---|
 | **[`SAT_Mistake_Log_v11.xlsm`](SAT_Mistake_Log_v11.xlsm)** | Windows Excel. Buttons inside the cells, paste question screenshots with Ctrl+V, click to zoom. Needs a one-time unblock. |
 | **[`SAT_Mistake_Log_v11_NoMacros.xlsx`](SAT_Mistake_Log_v11_NoMacros.xlsx)** | Mac, older Excel, Excel on the web, or anyone who can't run macros. No warning, nothing to enable. |
-| **[`SAT_Mistake_Log_Guide.pdf`](SAT_Mistake_Log_Guide.pdf)** | Step-by-step student guide for Windows, with real screenshots and arrows: unblocking, enabling macros, logging, pictures, and the dashboard. |
+| **[`SAT_Mistake_Log_Guide.pdf`](SAT_Mistake_Log_Guide.pdf)** | 5-page student guide for Windows, with real screenshots and arrows: unblocking, enabling macros, logging, pictures, and the dashboard. |
+| **[`SAT_Mistake_Log_Guide.html`](SAT_Mistake_Log_Guide.html)** | The same guide as a single web page - download it and open it in any browser. All screenshots are built in. |
 
 Check back here for new versions.
 
